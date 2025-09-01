@@ -163,9 +163,9 @@ def graficar_rmse_vs_contaminacion(df_resultados, theta_0, param_idx_cont, param
         linewidth=2.5,
     )
     
-    plt.title(f'RMSE($\\theta$) vs. Nivel de Contaminación del Parámetro {param_nombre_latex}', fontsize=18)
+   
     plt.xlabel(f'Valor del Parámetro Contaminado ({param_nombre_latex})', fontsize=14)
-    plt.ylabel('RMSE($\\theta$)', fontsize=14)
+    plt.ylabel('RMSE', fontsize=14)
     
     handles, labels = plot_rmse.get_legend_handles_labels()
     plot_rmse.legend(handles, labels, title=r'$\alpha$', fontsize=12, title_fontsize=14)
