@@ -1,0 +1,223 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import scipy.stats as stat
+import scipy.optimize as opt
+import os
+import seaborn as sns
+
+# --- Parámetros de la distribución Gamma ---
+def gamma_alpha_i(theta, s1, s2):
+  a0, a1, a2 = theta[0], theta[1], theta[2]
+  S1, S2 = np.meshgrid(s1, s2, indexing='ij')
+  return np.exp(a0 + a1 * S1 + a2 * S2).flatten()
+
+def gamma_lambda_i(theta, s1, s2):
+  b0, b1, b2 = theta[3], theta[4], theta[5]
+  S1, S2 = np.meshgrid(s1, s2, indexing='ij')
+  return np.exp(b0 + b1 * S1 + b2 * S2).flatten()
+
+# --- Funciones de Probabilidad ---
+def probabilidad_gamma(theta, IT, s1, s2):
+  alphai = gamma_alpha_i(theta, s1, s2)
+  lambdai = gamma_lambda_i(theta, s1, s2)
+  IT_col = IT[:, np.newaxis]
+  prob_matrix = stat.gamma.cdf(IT_col, a=alphai, scale=lambdai)
+  return prob_matrix.flatten()
+
+def gen_muestra_binomial_gamma(theta, IT, s1, s2, K, seed):
+  pi_theta = probabilidad_gamma(theta, IT, s1, s2)
+  np.random.seed(seed)
+  return np.random.binomial(K, pi_theta)
+
+def probabilidad_estimada(muestra, K):
+  return muestra / K
+
+# --- Funciones de Divergencia ---
+def divergencia_gamma(theta, alpha, IT, s1, s2, K, muestra):
+  eps = 1e-10
+  pi_theta1 = probabilidad_gamma(theta, IT, s1, s2)
+  pi_theta1 = np.clip(pi_theta1, eps, 1.0 - eps)
+  pi_theta2 = 1 - pi_theta1
+  p1 = probabilidad_estimada(muestra, K)
+  p1 = np.clip(p1, eps, 1.0 - eps)
+  p2 = 1 - p1
+  if alpha == 0:
+    div_kl_vector = K * (p1 * np.log(p1 / pi_theta1) + p2 * np.log(p2 / pi_theta2))
+    total_divergence = np.sum(div_kl_vector)
+  else:
+    term1 = pi_theta1**(1 + alpha) + pi_theta2**(1 + alpha)
+    term2 = (1 + 1/alpha) * (p1 * pi_theta1**alpha + p2 * pi_theta2**alpha)
+    div_alpha_vector = K * (term1 - term2)
+    total_divergence = np.sum(div_alpha_vector)
+  K_total = len(muestra) * K
+  return total_divergence / K_total
+
+# --- Estimador ---
+def emdp_gamma(theta_inicial, alpha, IT, s1, s2, K, muestra):
+  args = (alpha, IT, s1, s2, K, muestra)
+  options = {'maxfev':5000, 'xatol': 1e-6}
+  result = opt.minimize(divergencia_gamma, theta_inicial, args=args, method='Nelder-Mead',options=options)
+  if not result.success:
+      pass # Evitamos imprimir advertencias en cada fallo
+  return result.x
+
+# === SIMULACIÓN===
+
+
+def simulacion_para_rmse(R, theta_0, theta_inicial, theta_cont, IT, s1, s2, K, alphas):
+    """Función de simulación ."""
+    num_alphas = len(alphas)
+    num_params = len(theta_0)
+    estimators_cont = np.zeros((num_alphas, R, num_params))
+    
+    for i, alpha in enumerate(alphas):
+        for j in range(R):
+            muestra_clean = gen_muestra_binomial_gamma(theta_0, IT, s1, s2, K, seed=j)
+            muestra_cont_source = gen_muestra_binomial_gamma(theta_cont, IT, s1, s2, K, seed=j + R)
+            
+            muestra_contaminated = np.copy(muestra_clean)
+            muestra_contaminated[0] = muestra_cont_source[0]
+            
+            estimators_cont[i, j, :] = emdp_gamma(theta_inicial, alpha, IT, s1, s2, K, muestra_contaminated)
+    
+    se_cont = (estimators_cont - theta_0)**2
+    mse_cont_por_alpha = np.mean(se_cont, axis=(1, 2))
+    rmse_cont_por_alpha = np.sqrt(mse_cont_por_alpha)
+    
+    return pd.DataFrame({"alpha": alphas, "rmse_cont": rmse_cont_por_alpha})
+
+def generar_thetas_contaminados(theta_0, param_idx, deltas):
+    """Genera una lista de vectores de parámetros contaminados."""
+    thetas_contaminados = []
+    for delta in deltas:
+        theta_cont = np.copy(theta_0)
+        theta_cont[param_idx] += delta
+        thetas_contaminados.append(theta_cont)
+    return thetas_contaminados
+
+def ejecutar_simulacion_rmse(R, theta_0, theta_inicial, IT, s1, s2, K, alphas, param_idx_cont, deltas_cont):
+
+    lista_theta_cont = generar_thetas_contaminados(theta_0, param_idx_cont, deltas_cont)
+    resultados_rmse = []
+    
+    for i, theta_cont in enumerate(lista_theta_cont):
+        delta_actual = deltas_cont[i]
+        print(f"  Procesando Nivel {i+1}/{len(lista_theta_cont)} (delta={delta_actual:.4f})...")
+        df_rmse = simulacion_para_rmse(R, theta_0, theta_inicial, theta_cont, IT, s1, s2, K, alphas)
+        df_rmse['nivel_contaminacion_delta'] = delta_actual
+        resultados_rmse.append(df_rmse)
+        
+    return pd.concat(resultados_rmse, ignore_index=True)
+
+# GRÁFICOS
+
+def graficar_rmse_vs_contaminacion(df_resultados, theta_0, param_idx_cont, param_nombre, param_nombre_latex, output_path):
+
+    valor_real_param = theta_0[param_idx_cont]
+    df_resultados['valor_param_contaminado'] = valor_real_param + df_resultados['nivel_contaminacion_delta']
+    
+    sns.set_theme(style="whitegrid", rc={"grid.linestyle": ":"})
+    plt.figure(figsize=(12, 8))
+    
+    alphas_unicos = sorted(df_resultados['alpha'].unique())
+    palette = sns.color_palette("viridis_r", n_colors=len(alphas_unicos))
+    markers = ['o', 'v', '^', 'P', 's', 'D', '<', '>'] 
+    dashes_styles = [(1, 0), (4, 1.5), (1, 1), (5, 2, 1, 2), (8, 2), (3, 1.5, 1, 1.5)]
+    
+    plot_rmse = sns.lineplot(
+        data=df_resultados,
+        x='valor_param_contaminado',
+        y='rmse_cont',
+        hue='alpha',
+        style='alpha',
+        palette=palette,
+        markers=markers[:len(alphas_unicos)],
+        dashes=dashes_styles[:len(alphas_unicos)],
+        markersize=9,
+        linewidth=2.5,
+    )
+    
+    plt.xlabel(f'Valor del Parámetro Contaminado ({param_nombre_latex})', fontsize=14)
+    plt.ylabel('RMSE', fontsize=14)
+    
+    handles, labels = plot_rmse.get_legend_handles_labels()
+    plot_rmse.legend(handles, labels, title=r'$\alpha$', fontsize=12, title_fontsize=14)
+    
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+    
+    path_rmse_plot = os.path.join(output_path, f"grafico_rmse_contaminacion_{param_nombre}.png")
+    plt.savefig(path_rmse_plot, dpi=300, bbox_inches='tight')
+    print(f"\nGráfico de RMSE para {param_nombre} guardado en: {path_rmse_plot}")
+    plt.close()
+
+#EJECUCIÓN
+
+if __name__ == '__main__':
+    # --- Parámetros de simulación  ---
+    R = 1000
+    K = 100
+    IT_gamma = np.array([16, 24, 32])
+    s1_gamma = np.array([30, 40])
+    s2_gamma = np.array([40, 50])
+    alphas = np.array([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+
+    # --- Parámetros del modelo Gamma ---
+    theta_0_gamma = np.array([6.5, -0.06, -0.06, -0.5, 0.065, -0.01])
+    theta_inicial_gamma = np.array([6.5, -0.06, -0.06, -0.5, 0.065, -0.01])
+
+    # --- Nombres para los gráficos y archivos ---
+    param_nombres_gamma = ["a0", "a1", "a2", "b0", "b1", "b2"]
+    param_nombres_latex_gamma = [r"$\tilde{a}_0$", r"$\tilde{a}_1$", r"$\tilde{a}_2$", r"$\tilde{b}_0$", r"$\tilde{b}_1$", r"$\tilde{b}_2$"]
+
+    # --- CONFIGURACIÓN DE CONTAMINACIÓN PARA CADA PARÁMETRO DE GAMMA ---
+    contaminacion_config_gamma = {
+        0: np.linspace(0, 0.45, 7),        # Deltas para a0 (valor real 6.5)
+        1: np.linspace(0, 0.012, 7),      # Deltas para a1 (valor real -0.06)
+        2: np.linspace(0, 0.012, 7),      # Deltas para a2 (valor real -0.06)
+        3: np.linspace(0, 0.45, 7),        # Deltas para b0 (valor real -0.5)
+        4: np.linspace(0, 0.015, 7),      # Deltas para b1 (valor real 0.065)
+        5: np.linspace(0, 0.015, 7)       # Deltas para b2 (valor real -0.01)
+    }
+
+    # --- Directorio de salida ---
+    output_path = "graficos_gamma_nivel_contaminacion/"
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    # --- BUCLE PRINCIPAL PARA EJECUTAR SIMULACIÓN Y GRÁFICOS PARA CADA PARÁMETRO ---
+    for param_idx in range(len(theta_0_gamma)):
+        
+        param_nombre_actual = param_nombres_gamma[param_idx]
+        param_nombre_latex_actual = param_nombres_latex_gamma[param_idx]
+        deltas_actuales = contaminacion_config_gamma[param_idx]
+        
+        print("\n" + "="*80)
+        print(f"INICIANDO ANÁLISIS DE CONTAMINACIÓN GAMMA PARA EL PARÁMETRO: {param_nombre_actual.upper()}")
+        print(f"Valor real: {theta_0_gamma[param_idx]:.4f}")
+        print(f"Deltas de contaminación a probar: {np.round(deltas_actuales, 4)}")
+        print("="*80)
+        
+        df_resultados_rmse = ejecutar_simulacion_rmse(
+            R, theta_0_gamma, theta_inicial_gamma, IT_gamma, s1_gamma, s2_gamma, K, alphas,
+            param_idx, deltas_actuales
+        )
+        
+        csv_path = os.path.join(output_path, f"rmse_data_contaminacion_{param_nombre_actual}.csv")
+        df_resultados_rmse.to_csv(csv_path, index=False)
+        print(f"\nArchivo CSV con resultados para {param_nombre_actual} guardado en '{csv_path}'")
+        
+        graficar_rmse_vs_contaminacion(
+            df_resultados_rmse, 
+            theta_0_gamma, 
+            param_idx,
+            param_nombre_actual,
+            param_nombre_latex_actual,
+            output_path
+        )
+        
+        print(f"\n--- Análisis Gamma para {param_nombre_actual.upper()} completado. ---")
+
+    print("\n\nTODOS LOS ANÁLISIS DE CONTAMINACIÓN PARA GAMMA HAN FINALIZADO.")
+
